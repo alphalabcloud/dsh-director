@@ -8,13 +8,49 @@ const binding=(node,port,value,graph)=>link(value,graph)?{node:String(node),port
 const consumers=(graph,nodeId,output)=>Object.entries(graph).flatMap(([id,node])=>Object.entries(node?.inputs??{}).filter(([,value])=>link(value,graph)&&String(value[0])===String(nodeId)&&Number(value[1])===output).map(([port])=>({node:id,port,type:node.class_type})));
 const knownH3=graph=>Object.values(graph).some(node=>['MiniMaxH3ReferenceToVideo','MiniMaxH3ImageToVideo','MiniMaxH3FirstLastFrameToVideo'].includes(node?.class_type));
 
+// Family-aware H3 sampler detection. SelfLiftH3Sampler carries conditioning on
+// positive / negative and has no guider socket at all, so a guider-only filter can
+// never certify a MotionContext chain built on it, however correct that chain is.
+const SAMPLER_CLASSES=new Set(['SamplerCustomAdvanced','SelfLiftH3Sampler']);
+const isH3Sampler=node=>SAMPLER_CLASSES.has(node?.class_type);
+const samplerConditioning=node=>Object.entries(node?.inputs??{}).filter(([port])=>(node?.class_type==='SelfLiftH3Sampler'?['positive','negative']:['guider']).includes(port)).map(([,value])=>value);
+
+// A ComfySwitchNode executes only its selected branch; the other branch is lazy and
+// never runs. When the selector boolean resolves, follow that branch alone, because
+// certifying continuity through a branch that never executes would be a fiction. When
+// the selector cannot be resolved, keep the previous permissive scan rather than
+// silently becoming stricter.
+function resolveSwitchSelection(value,graph,seen=new Set()){
+  const node=nodeAt(value,graph);
+  if(!node)return undefined;
+  if(node.class_type==='PrimitiveBoolean')return typeof node.inputs?.value==='boolean'?node.inputs.value:undefined;
+  if(node.class_type==='ComfySwitchNode'){
+    const key=`${value[0]}:${value[1]}`;
+    if(seen.has(key))return undefined;
+    seen.add(key);
+    return resolveSwitchSelection(node.inputs?.switch,graph,seen);
+  }
+  return undefined;
+}
+function upstreamLinks(nodeId,graph){
+  const node=graph[String(nodeId)];
+  if(node?.class_type==='ComfySwitchNode'){
+    const enabled=resolveSwitchSelection(node.inputs?.switch,graph);
+    if(typeof enabled==='boolean'){
+      const branch=enabled?node.inputs?.on_true:node.inputs?.on_false;
+      return branch?[branch]:[];
+    }
+  }
+  return Object.values(node?.inputs??{});
+}
+
 function dependsOn(value,id,output,graph,seen=new Set()){
   if(!link(value,graph))return false;
   if(String(value[0])===String(id)&&Number(value[1])===output)return true;
   const key=`${value[0]}:${value[1]}`;
   if(seen.has(key))return false;
   seen.add(key);
-  return Object.values(graph[String(value[0])].inputs??{}).some(input=>dependsOn(input,id,output,graph,seen));
+  return upstreamLinks(value[0],graph).some(input=>dependsOn(input,id,output,graph,seen));
 }
 
 function savedVideoOutputs(graph){
@@ -32,7 +68,7 @@ function hasPriorContext(node,graph){
 // A loader socket alone is not evidence that context affects the saved video.
 function verifyH3Context(graph,contextId,outputs,outputSamplers){
   if(!knownH3(graph))return null;
-  const samplers=outputSamplers.filter(([,node])=>dependsOn(node.inputs?.guider,contextId,0,graph));
+  const samplers=outputSamplers.filter(([,node])=>samplerConditioning(node).some(value=>dependsOn(value,contextId,0,graph)));
   const issues=[];
   if(!samplers.length)issues.push('MotionContext conditioning does not reach the current sampler guider.');
   const trims=nodesOf(graph,'MiniMaxH3MotionContextTrim').filter(([,node])=>
@@ -66,7 +102,7 @@ export function inspectComfyGraph(graph){
   const classes=Object.fromEntries([...new Set(Object.values(graph).map(node=>node?.class_type).filter(Boolean))].sort().map(type=>[type,nodesOf(graph,type).length]));
   const contexts=nodesOf(graph,'MiniMaxH3MotionContext');
   const saves=nodesOf(graph,'MiniMaxH3MotionContextSaveLatent');
-  const sampler=nodesOf(graph,'SamplerCustomAdvanced');
+  const sampler=Object.entries(graph).filter(([,node])=>isH3Sampler(node));
   const outputs=savedVideoOutputs(graph);
   // Inspect graph fragments as before; a real saved output defines which branch
   // can establish continuity and which sampler's latent belongs to that video.
@@ -75,7 +111,7 @@ export function inspectComfyGraph(graph){
   const relevantContexts=contexts.filter(([id])=>reachesOutput(id));
   const activeContext=relevantContexts.find(([,node])=>hasPriorContext(node,graph));
   const selectedContext=activeContext??relevantContexts[0];
-  const currentSamplers=knownH3(graph)&&activeContext?outputSamplers.filter(([,node])=>dependsOn(node.inputs?.guider,activeContext[0],0,graph)):outputSamplers;
+  const currentSamplers=knownH3(graph)&&activeContext?outputSamplers.filter(([,node])=>samplerConditioning(node).some(value=>dependsOn(value,activeContext[0],0,graph))):outputSamplers;
   const savedNodes=saves.filter(([,node])=>currentSamplers.some(([id])=>String(node.inputs?.latent?.[0])===id&&Number(node.inputs?.latent?.[1])===0));
   const saved=savedNodes.length>0;
   const rawSaveIndex=savedNodes.length===1?Number(savedNodes[0][1].inputs?.clip_index):NaN;
