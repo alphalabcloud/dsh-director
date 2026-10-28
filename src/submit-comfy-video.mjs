@@ -355,9 +355,13 @@ async function releaseComfyMemory({fetchImpl, sleep, signal, pollIntervalMs, rel
         })
         // Torch reserved bytes alone omit allocations such as Dynamic VRAM/aimdo.
         // This is conservative headroom evidence, not proof that a particular LLM fits.
-        const cleared = devices.every(device=>device.type==='cpu' || (device.torch_reserved_bytes<=64*1024**2 && device.physical_free_bytes>=device.vram_total*0.9))
+        // The ceiling must sit above the allocator floor: with cudaMallocAsync this install keeps a
+        // residual 32-96 MiB reservation after /free, so a 64 MiB ceiling could never certify an
+        // honestly idle ComfyUI. The >=90% physical headroom test still decides fitting.
+        const torchCeiling = device => Math.max(256*1024**2, Math.round(device.vram_total*0.02))
+        const cleared = devices.every(device=>device.type==='cpu' || (device.torch_reserved_bytes<=torchCeiling(device) && device.physical_free_bytes>=device.vram_total*0.9))
         if (cleared && await queueIdle()) return {verified:true,devices}
-        lastReason = 'ComfyUI VRAM release/headroom was not confirmed (requires <=64 MiB Torch reserved and >=90% physical free)'
+        lastReason = 'ComfyUI VRAM release/headroom was not confirmed (requires Torch reserved <= max(256 MiB, 2% of VRAM) and >=90% physical free)'
       }
       await monitorSleep(Math.min(pollIntervalMs, Math.max(1,deadline-now())), {sleep, signal})
     }
@@ -420,11 +424,28 @@ async function monitorComfyPrompt(promptId, options) {
       // Publish artifacts before cleanup, but do not settle the registry job: any
       // unreported terminal outcome would wake the model, including failures.
       pending({verified: false, warning: 'VRAM release verification pending'})
+      // Bounded handoff. An unattainable verification - the swap LLM legitimately holding the GPU,
+      // an allocator floor, a ComfyUI that has to be restarted - must not keep the chat paused
+      // forever, which is what happened here: waiting_for_vram was published with no ceiling and the
+      // handoff never settled, so sending stayed blocked until the harness was restarted. After 3 full
+      // release rounds the job settles as completed with the release reported honestly as unverified.
+      // Nothing is re-queued and nothing here claims the GPU is free. Set DSH_DIRECTOR_RELEASE_ATTEMPTS=0
+      // to restore waiting forever.
+      const releaseAttemptLimit = Number(process.env.DSH_DIRECTOR_RELEASE_ATTEMPTS ?? 3)
+      let releaseAttempts = 0
       while (!signal.aborted) {
+        releaseAttempts++
         const release = await releaseComfyMemory({...options, pollIntervalMs: Math.max(pollIntervalMs, handoffRetryIntervalMs)})
         signal.throwIfAborted()
         if (release.verified) {
           const final = {...output, phase: 'ready_for_review', comfy_release: release}
+          publish(final)
+          return {status: output.execution_status, detail, output: JSON.stringify(final)}
+        }
+        if (releaseAttemptLimit > 0 && releaseAttempts >= releaseAttemptLimit) {
+          const final = {...output, phase: 'ready_for_review', comfy_release: {...release, handoff_unverified: true},
+            gpu_release_unverified: true,
+            handoff_instruction: 'ComfyUI execution ended and the saved outputs are readable, but GPU release could not be verified. Check live GPU evidence before queueing another generation (node tools/diagnose-gpu-handoff.mjs) and unload the swap model first; never resubmit this prompt to clear the state.'}
           publish(final)
           return {status: output.execution_status, detail, output: JSON.stringify(final)}
         }
@@ -718,7 +739,7 @@ function toolDefinition({ startJob, toolName = 'submit_comfy_job', ...options } 
       'A failed background job is terminal for that submission. Never retry an identical failed workflow automatically; inspect the error and change the workflow before submitting again.',
       'After completion, use job output_artifacts and its ComfyUI view_url to retrieve outputs for review. For a loopback view_url, download it to the workspace with a shell HTTP client such as PowerShell Invoke-WebRequest or curl, then inspect that exact file; never use web_fetch for localhost and do not search entire drives.',
       'This tool concludes the turn after an accepted submission.',
-      'Monitoring waits for verified GPU release before waking the Agent. waiting_for_vram means handoff, not new generation: inspect job_output, never resubmit a completed/failed prompt.',
+      'Monitoring waits for verified GPU release before waking the Agent, but it settles after 3 release rounds with gpu_release_unverified instead of pausing sending forever. waiting_for_vram means handoff, not new generation: inspect job_output, never resubmit a completed/failed prompt. Check live GPU evidence with node tools/diagnose-gpu-handoff.mjs before queueing another generation.',
       'Use validate_only=true before submission. Check submission_ready and issues/submission_blockers; validation never queues, unloads or ends the turn. status=blocked is an actionable prerequisite, not a failed generation. retry_identical=false means repair its cause or wait for confirmation; never retry the same arguments or re-create an unchanged card to clear it.',
       'For dependent H3 clips prefer compatible saved sampler latent Motion Context. A previous clip video can also supply consecutive context_frames (video_frames), plus context_audio when supported; this multi-frame motion history is different from extracting one tail frame as a Picture or guide. Set continuity_requirement to the inspected route (sampler_latent or video_frames) on validation and submission; never label video_frames as original sampler latent. Honor an explicit saved-latent requirement and report missing latent before proposing a rerender. Verify source, conditioning-to-sampler wiring, trim and output; a MotionContext node alone is not proof of continuation. Put the actual workflow path, route and source on the review card before approval. Independent I2V/FLF workflows remain available.',
       'Provide exactly one of workflow_path or workflow. Raw node graphs and {prompt: ...} wrappers are accepted.',

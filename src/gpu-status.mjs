@@ -11,39 +11,60 @@ export function createGpuStatus({comfyBaseUrl='http://127.0.0.1:8188',llamaSwapB
   function update(value){
     if(!value?.prompt_id)return;
     if(['ready_for_review','submission_failed'].includes(value.phase))tasks.delete(value.prompt_id);
-    else tasks.set(value.prompt_id,{phase:value.phase});
+    else tasks.set(value.prompt_id,{phase:value.phase,at:Date.now(),terminal:value.execution_status==='completed'||value.execution_status==='failed'||value.phase==='cancelled'||value.phase==='unmonitored'});
     if(value.execution_status==='failed')lastWarning='Video generation failed. Check the job error before retrying.';
   }
-  let lastWarning,knownGpuRisk=false;
+  let lastWarning,knownGpuRiskAt=0;
   async function sample(){
     try{
       const get=async(base,path)=>{const r=await fetchImpl(new URL(path,base),{redirect:'error',signal:AbortSignal.timeout(4000)});if(!r.ok)throw Error('Service unavailable');return r.json();};
       const evidence=await Promise.allSettled([get(comfyBaseUrl,'/queue'),get(llamaSwapBaseUrl,'/running'),get(comfyBaseUrl,'/system_stats')]);
       const queue=evidence[0].value;
-      if(Array.isArray(queue?.queue_running)&&Array.isArray(queue?.queue_pending)&&(queue.queue_running.length||queue.queue_pending.length))knownGpuRisk=true;
+      if(Array.isArray(queue?.queue_running)&&Array.isArray(queue?.queue_pending)&&(queue.queue_running.length||queue.queue_pending.length))knownGpuRiskAt=Date.now();
       if(evidence.some(value=>value.status==='rejected'))throw Error('Incomplete GPU evidence');
       const running=evidence[1].value,stats=evidence[2].value;
       const queueCounts=q=>{if(!Array.isArray(q?.queue_running)||!Array.isArray(q?.queue_pending))throw Error('Invalid queue');return {running:q.queue_running.length,queued:q.queue_pending.length};};
       const llm=models(running)?'loaded':'unloaded';
       const devices=stats?.devices?.filter(d=>d.type==='cuda');
       if(!devices?.length||devices.some(d=>![d.vram_total,d.vram_free,d.torch_vram_total,d.torch_vram_free].every(v=>Number.isFinite(v)&&v>=0)||d.vram_total===0||d.vram_free>d.vram_total||d.torch_vram_free>d.torch_vram_total||d.torch_vram_total>d.vram_total))throw Error('Invalid GPU evidence');
-      const cacheFree=devices.every(d=>d.torch_vram_total<=64*MiB);
+      // The allocator floor is not a leak. This install runs cudaMallocAsync, which keeps a
+      // residual reservation after /free (measured 32 MiB on a fresh process, 96 MiB after a
+      // render), so a 64 MiB ceiling sits right on that boundary and can never certify an
+      // honestly idle ComfyUI. Tolerate the floor and keep the physical-headroom test, which is
+      // what actually decides whether the swap LLM has room to load.
+      const torchFloor=d=>Math.max(256*MiB,Math.round(d.vram_total*0.02));
+      const cacheFree=devices.every(d=>d.torch_vram_total<=torchFloor(d));
       const physicalFree=cacheFree&&devices.every(d=>(d.vram_free-d.torch_vram_free)/d.vram_total>=0.9);
       const counts=queueCounts(queue),busy=counts.running+counts.queued;
-      const generating=c=>{knownGpuRisk=true;return {phase:'generating',blocked:true,llm,...c,...(llm==='loaded'?{warning:'LLM is loaded while ComfyUI is running. Sending is paused to avoid a VRAM conflict.'}:{})};};
+      const generating=c=>{knownGpuRiskAt=Date.now();return {phase:'generating',blocked:true,llm,...c,...(llm==='loaded'?{warning:'LLM is loaded while ComfyUI is running. Sending is paused to avoid a VRAM conflict.'}:{})};};
       if(busy)return generating(counts);
-      // Cancelling a monitor is not release evidence. Recover only from fresh GPU evidence.
-      if(physicalFree)for(const [id,t] of tasks)if(['cancelled','unmonitored'].includes(t.phase))tasks.delete(id);
+      // Cancelling a monitor is not release evidence. But a monitor that has stopped publishing
+      // with a known terminal outcome must not hold the chat paused forever: verified release can
+      // be unachievable while the swap LLM legitimately holds the GPU, and one stuck entry there
+      // blocks sending until the whole harness is restarted. Sweep stale entries only when fresh
+      // evidence says the ComfyUI queue is idle, then let the live GPU checks below decide.
+      const sampleAt=Date.now();
+      for(const [id,t] of [...tasks]){
+        const cancelled=['cancelled','unmonitored'].includes(t.phase);
+        const age=sampleAt-(t.at??sampleAt);
+        // Hard ceiling: this sweep only runs while the ComfyUI queue is idle, so an entry with no
+        // monitor refresh for 10 minutes describes a dead monitor, not a live render (a live render
+        // keeps the queue busy and returns before this point). Expired entries stop pausing sending,
+        // and the expiry is reported instead of being presented as release evidence.
+        if(age>600_000){lastWarning='Handoff state expired after 10 minutes with the ComfyUI queue idle and no monitor update; sending resumed. This is not release evidence: check live GPU evidence before queueing another generation.';tasks.delete(id);continue;}
+        const stale=(t.terminal||cancelled)&&age>60_000;
+        if(stale||(cancelled&&physicalFree))tasks.delete(id);
+      }
       const active=[...tasks.values()];
       if(active.length)return {phase:active.some(t=>['queued','unloading_llm','generating'].includes(t.phase))?'generating':'releasing_vram',blocked:true,llm,...(active.some(t=>['monitor_error','waiting_for_history','unmonitored'].includes(t.phase))?{warning:'GPU handoff is not verified. Check the job monitor; do not resubmit the video.'}:{})};
-      if(!cacheFree||(llm==='unloaded'&&!physicalFree)){knownGpuRisk=true;return {phase:'releasing_vram',blocked:true,llm,warning:'ComfyUI memory is not released yet. Sending stays paused until GPU release is verified.'};}
+      if(!cacheFree||(llm==='unloaded'&&!physicalFree)){knownGpuRiskAt=Date.now();return {phase:'releasing_vram',blocked:true,llm,warning:'ComfyUI memory is not released yet. Sending stays paused until GPU release is verified.'};}
       // Statistics may be slow. Do not publish old idle evidence after a new prompt.
       const finalQueue=queueCounts(await get(comfyBaseUrl,'/queue'));
       if(finalQueue.running+finalQueue.queued)return generating(finalQueue);
       if(tasks.size)return {phase:'releasing_vram',blocked:true,llm};
-      knownGpuRisk=false;
+      knownGpuRiskAt=0;
       return {phase:'ready',blocked:false,llm,...(lastWarning?{warning:lastWarning}:{})};
-    }catch{return unknown(tasks.size>0||knownGpuRisk);}
+    }catch{return unknown(tasks.size>0||Date.now()-knownGpuRiskAt<90_000);}
   }
   async function recover(){
     if(tasks.size)throw Error('A managed ComfyUI handoff is still active');
